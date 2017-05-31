@@ -129,16 +129,16 @@ failing to identify a gc-tracked pointer alters the resulting program behavior
 dramatically - it'll probably crash or return wrong results. We currently use
 three different addressspaces (their numbers are defined in src/codegen_shared.cpp):
 
-- GC Tracked Pointers (10): These are pointers to boxed values that may be put
+- GC Tracked Pointers (currently 10): These are pointers to boxed values that may be put
   into a GC frame. It is loosely equivalent to a `jl_value_t*` pointer on the C
   side. N.B. It is illegal to ever have a pointer in this address space that may
   not be stored to a GC slot.
-- Derived Pointers (11): These are pointers that are derived from some GC
+- Derived Pointers (currently 11): These are pointers that are derived from some GC
   tracked pointer. Uses of these pointers generate uses of the original pointer.
   However, they need not themselves be known to the GC. The GC root placement
   pass MUST always find the GC tracked pointer from which this pointer is
   derived and use that as the pointer to root.
-- Callee Rooted Pointers (12): This is a utility address space to express the
+- Callee Rooted Pointers (currently 12): This is a utility address space to express the
   notion of a callee rooted value. All values of this address space MUST be
   storable to a GC root (though it is possible to relax this condition in the
   future), but unlike the other pointers need not be rooted if passed to a
@@ -150,34 +150,35 @@ The GC root placement pass makes use of several invariants, which need
 to be observed by the frontend and are preserved by the optimizer.
 
 First, only the following addressspace casts are allowed
-- 0->{10,11,12}: It is allowable to decay an untracked pointer to any of the
+- 0->{Tracked,Derived,CalleeRooted}: It is allowable to decay an untracked pointer to any of the
   other. However, do note that the optimizer has broad license to not root
   such a value. It is never safe to have a value in addressspace 0 in any part
   of the program if it is (or is derived from) a value that requires a GC root.
-- 10->11: This is the standard decay route for interior values. The placement
+- Tracked->Derived: This is the standard decay route for interior values. The placement
   pass will look for these to identify the base pointer for any use.
-- 10->12: Addressspace 12 servers merely as a hint that a GC root is not
-  required. However, do note that the 11->12 decay is prohibited, since
+- Tracked->CalleeRooted: Addrspace CalleeRooted serves merely as a hint that a GC root is not
+  required. However, do note that the Derived->CalleeRooted decay is prohibited, since
   pointers should generally be storable to a GC slot, even in this address space.
 
 Now let us consider what constitutes a use:
 - Loads whose loaded values is in one of the address spaces
 - Stores of a value in one of the address spaces to a location
+- Stores to a pointer in one of the address spaces
 - Calls for which a value in one of the address spaces is an operand
 - Calls in jlcall ABI, for which the argument array contains a value
 - Return instructions.
 
-We explicitly allow load/stores and simple calls in address space 10/11. Elements of jlcall
-argument arrays must always be in address space 10 (it is required by the ABI that
+We explicitly allow load/stores and simple calls in address spaces Tracked/Derived. Elements of jlcall
+argument arrays must always be in address space Tracked (it is required by the ABI that
 they are valid `jl_value_t*` pointers). The same is true for return instructions
 (though note that struct return arguments are allowed to have any of the address
-spaces). The only allowable use of an address space 11 pointer is to pass it to
+spaces). The only allowable use of an address space CalleRooted pointer is to pass it to
 a call (which must have an appropriately typed operand).
 
-Further, we disallow getelementptr in addrspace(10). This is because unless
+Further, we disallow getelementptr in addrspace Tracked. This is because unless
 the operation is a noop, the resulting pointer will not be validly storable
 to a GC slot and may thus not be in this address space. If such a pointer
-is required, it should be decayed to addrspace(11) first.
+is required, it should be decayed to addrspace Derived first.
 
 Lastly, we disallow inttoptr/ptrtoint instructions in these address spaces.
 Having these instructions would mean that some i64 values are really gc tracked.

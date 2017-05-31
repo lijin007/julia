@@ -522,18 +522,7 @@ JuliaOJIT::JuliaOJIT(TargetMachine &TM)
             }
         )
 {
-    if (!jl_generating_output()) {
-        addOptimizationPasses(&PM, jl_options.opt_level);
-    }
-    else {
-        PM.add(createGCInvariantVerifierPass(true));
-        PM.add(createVerifierPass());
-        //PM.add(createLowerGCFramePass());
-        PM.add(createLowerExcHandlersPass());
-        PM.add(createLateLowerGCFramePass());
-        PM.add(createLowerPTLSPass(imaging_mode));
-        PM.add(createVerifierPass());
-    }
+    addOptimizationPasses(&PM, jl_generating_output() ? 0 : jl_options.opt_level);
     if (TM.addPassesToEmitMC(PM, Ctx, ObjStream))
         llvm_unreachable("Target does not support MC emission.");
 

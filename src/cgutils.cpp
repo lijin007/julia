@@ -28,18 +28,18 @@ static Value *prepare_call(Value *Callee)
 static Value *maybe_decay_untracked(Value *V)
 {
     if (V->getType() == T_pjlvalue)
-      return builder.CreateAddrSpaceCast(V, T_prjlvalue);
+        return builder.CreateAddrSpaceCast(V, T_prjlvalue);
     else if (V->getType() == T_ppjlvalue)
-      return builder.CreateBitCast(V, T_pprjlvalue);
+        return builder.CreateBitCast(V, T_pprjlvalue);
     return V;
 }
 
 static Constant *maybe_decay_untracked(Constant *C)
 {
     if (C->getType() == T_pjlvalue)
-      return cast<Constant>(builder.CreateAddrSpaceCast(C, T_prjlvalue));
+        return ConstantExpr::getAddrSpaceCast(C, T_prjlvalue);
     else if (C->getType() == T_ppjlvalue)
-      return cast<Constant>(builder.CreateBitCast(C, T_pprjlvalue));
+        return ConstantExpr::getBitCast(C, T_pprjlvalue);
     return C;
 }
 
@@ -48,6 +48,7 @@ static Value *decay_derived(Value *V)
     Type *T = V->getType();
     if (cast<PointerType>(T)->getAddressSpace() == AddressSpace::Derived)
         return V;
+    // Once llvm deletes pointer element types, we won't need it here any more either.
     Type *NewT = PointerType::get(cast<PointerType>(T)->getElementType(), AddressSpace::Derived);
     return builder.CreateAddrSpaceCast(V, NewT);
 }
@@ -1067,8 +1068,8 @@ static std::pair<Value*, bool> emit_isa(const jl_cgval_t &x, jl_value_t *type, c
 
     // intersection with Type needs to be handled specially
     if (jl_has_intersect_type_not_kind(type)) {
-        Value *vx = mark_callee_rooted(boxed(x, ctx));
-        Value *vtyp = mark_callee_rooted(literal_pointer_val(type));
+        Value *vx = maybe_decay_untracked(boxed(x, ctx));
+        Value *vtyp = literal_pointer_val(type);
         if (msg && *msg == "typeassert") {
 #if JL_LLVM_VERSION >= 30700
             builder.CreateCall(prepare_call(jltypeassert_func), { vx, vtyp });
@@ -1120,12 +1121,12 @@ static std::pair<Value*, bool> emit_isa(const jl_cgval_t &x, jl_value_t *type, c
     return std::make_pair(builder.CreateICmpNE(
 #if JL_LLVM_VERSION >= 30700
             builder.CreateCall(prepare_call(jlsubtype_func),
-              { mark_callee_rooted(vxt),
-                mark_callee_rooted(literal_pointer_val(type)) }),
+              { vxt,
+                literal_pointer_val(type) }),
 #else
             builder.CreateCall2(prepare_call(jlsubtype_func),
-                mark_callee_rooted(vxt),
-                mark_callee_rooted(literal_pointer_val(type))),
+                vxt,
+                literal_pointer_val(type)),
 #endif
             ConstantInt::get(T_int32, 0)), false);
 }
@@ -2102,6 +2103,8 @@ static Value *box_union(const jl_cgval_t &vinfo, jl_codectx_t *ctx, const SmallB
             // if this is a derived pointer, make sure the root usage itself is also visible to the delete-root pass
             mark_gc_use(vinfo);
         }
+        // We're guaranteed here that Load(.gcroot) == .V, because we have determined
+        // that this union is a boxed value, rather than an interior pointer of some sort
         box_merge->addIncoming(builder.CreateLoad(vinfo.gcroot), defaultBB);
         builder.CreateBr(postBB);
     }
@@ -2122,6 +2125,8 @@ static Value *boxed(const jl_cgval_t &vinfo, jl_codectx_t *ctx, bool gcrooted)
         return literal_pointer_val(vinfo.constant);
     if (vinfo.isboxed) {
         assert(vinfo.V && "Missing value for box.");
+        // We're guaranteed here that Load(.gcroot) == .V, because we have determined
+        // that this value is a box, so if it has a gcroot, that's where the value is.
         return vinfo.gcroot ? builder.CreateLoad(vinfo.gcroot) : vinfo.V;
     }
 

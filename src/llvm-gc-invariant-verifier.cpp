@@ -44,9 +44,9 @@ private:
 
 public:
     void getAnalysisUsage(AnalysisUsage &AU) const override {
-      FunctionPass::getAnalysisUsage(AU);
-      AU.setPreservesAll();
-  }
+        FunctionPass::getAnalysisUsage(AU);
+        AU.setPreservesAll();
+    }
 
     bool runOnFunction(Function &F) override;
     void visitAddrSpaceCastInst(AddrSpaceCastInst &I);

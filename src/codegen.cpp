@@ -2376,7 +2376,6 @@ static void simple_escape_analysis(jl_value_t *expr, bool esc, jl_codectx_t *ctx
 static Value *emit_local_root(jl_codectx_t *ctx, jl_varinfo_t *vi)
 {
     Instruction *newroot = new AllocaInst(T_prjlvalue, 0, "gcroot", /*InsertBefore*/ctx->ptlsStates);
-    // CallInst *newroot = CallInst::Create(prepare_call(gcroot_func), "", /*InsertBefore*/ctx->ptlsStates);
     if (vi) {
         vi->boxroot->replaceAllUsesWith(newroot);
         newroot->takeName(vi->boxroot);
@@ -2401,11 +2400,6 @@ static void mark_gc_use(const jl_cgval_t &v)
 // turn an array of arguments into a single object suitable for passing to a jlcall
 static Value *make_jlcall(ArrayRef<const jl_cgval_t*> args, jl_codectx_t *ctx)
 {
-    // the temporary variables are after all local variables in the GC frame.
-    // CallInst *largs = CallInst::Create(prepare_call(jlcall_frame_func),
-    //         ConstantInt::get(T_int32, args.size()),
-    //         "",
-    //         /*InsertBefore*/ctx->ptlsStates);
     Value *largs = new AllocaInst(T_prjlvalue,
 #if JL_LLVM_VERSION >= 50000
       0,
@@ -2741,8 +2735,8 @@ static bool emit_builtin_call(jl_cgval_t *ret, jl_value_t *f, jl_value_t **args,
         }
         if (jl_subtype(ty, (jl_value_t*)jl_type_type)) {
             *ret = emit_expr(args[1], ctx);
-            Value *rt_ty = mark_callee_rooted(boxed(emit_expr(args[2], ctx), ctx));
-            Value *rt_val = mark_callee_rooted(boxed(*ret, ctx));
+            Value *rt_ty = boxed(emit_expr(args[2], ctx), ctx);
+            Value *rt_val = boxed(*ret, ctx);
             JL_FEAT_REQUIRE(ctx, runtime);
 #if JL_LLVM_VERSION >= 30700
             builder.CreateCall(prepare_call(jltypeassert_func), {rt_val, rt_ty});
@@ -3845,6 +3839,8 @@ static void emit_assignment(jl_value_t *l, jl_value_t *r, jl_codectx_t *ctx)
                     Value *box;
                     if (slot.gcroot) {
                         gcroot = emit_local_root(ctx);
+                        // This might load the wrong object in general, but if it gets selected, below,
+                        // we know that it was in fact the one we wanted.
                         box = builder.CreateLoad(slot.gcroot);
                     } else {
                         gcroot = emit_static_alloca(T_pjlvalue);
@@ -4809,7 +4805,7 @@ static Function *gen_cfun_wrapper(jl_function_t *ff, jl_value_t *jlrettype, jl_t
 #if JL_LLVM_VERSION >= 50000
             0,
 #endif
-            ConstantInt::get(T_int32, nargs +1), "jlcall", ctx2.ptlsStates);
+            ConstantInt::get(T_int32, nargs + 1), "jlcall", ctx2.ptlsStates);
         if (cc == jl_returninfo_t::SRet || cc == jl_returninfo_t::Union)
             ++AI;
         for (size_t i = 0; i < nargs + 1; i++) {
@@ -6387,8 +6383,6 @@ static std::unique_ptr<Module> emit_function(
         JL_UNLOCK(&m->writelock);
     }
 
-    assert(!llvm::verifyModule(*M, &dbgs()));
-
     JL_GC_POP();
     return std::unique_ptr<Module>(M);
 }
@@ -7037,28 +7031,31 @@ static void init_julia_llvm_env(Module *m)
                          "jl_pop_handler", m);
     add_named_global(jlleave_func, &jl_pop_handler);
 
-    std::vector<Type *> args_2vals(0);
-    args_2vals.push_back(PointerType::get(T_jlvalue, AddressSpace::CalleeRooted));
-    args_2vals.push_back(PointerType::get(T_jlvalue, AddressSpace::CalleeRooted));
+    std::vector<Type *> args_2vals_callee_rooted(0);
+    args_2vals_callee_rooted.push_back(PointerType::get(T_jlvalue, AddressSpace::CalleeRooted));
+    args_2vals_callee_rooted.push_back(PointerType::get(T_jlvalue, AddressSpace::CalleeRooted));
     jlegal_func =
-        Function::Create(FunctionType::get(T_int32, args_2vals, false),
+        Function::Create(FunctionType::get(T_int32, args_2vals_callee_rooted, false),
                          Function::ExternalLinkage,
                          "jl_egal", m);
     add_named_global(jlegal_func, &jl_egal);
 
+    std::vector<Type *> args_2vals_tracked(0);
+    args_2vals_tracked.push_back(T_prjlvalue);
+    args_2vals_tracked.push_back(T_prjlvalue);
     jlisa_func =
-        Function::Create(FunctionType::get(T_int32, args_2vals, false),
+        Function::Create(FunctionType::get(T_int32, args_2vals_tracked, false),
                          Function::ExternalLinkage,
                          "jl_isa", m);
     add_named_global(jlisa_func, &jl_isa);
 
     jlsubtype_func =
-        Function::Create(FunctionType::get(T_int32, args_2vals, false),
+        Function::Create(FunctionType::get(T_int32, args_2vals_tracked, false),
                          Function::ExternalLinkage,
                          "jl_subtype", m);
     add_named_global(jlsubtype_func, &jl_subtype);
 
-    jltypeassert_func = Function::Create(FunctionType::get(T_void, args_2vals, false),
+    jltypeassert_func = Function::Create(FunctionType::get(T_void, args_2vals_tracked, false),
                                         Function::ExternalLinkage,
                                         "jl_typeassert", m);
     add_named_global(jltypeassert_func, &jl_typeassert);

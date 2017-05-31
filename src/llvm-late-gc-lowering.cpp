@@ -42,12 +42,13 @@ using namespace llvm;
    1. Local Scan
 
       During this step, each Basic Block is inspected and analyzed for local
-      properties. In particular, we want to determine:
+      properties. In particular, we want to determine the ordering of any of
+      the following activities:
 
         - Any Def of a gc-tracked pointer. In general Defs are the results of
           calls or loads from appropriate memory locations. Phi nodes and
           selects do complicate this story slightly as described below.
-        - Any use of a gc-tracked or derived pointer. As descrbied in the
+        - Any use of a gc-tracked or derived pointer. As described in the
           devdocs, a use is in general one of
               a) a load from a tracked/derived value
               b) a store to a tracked/derived value
@@ -59,7 +60,7 @@ using namespace llvm;
       Crucially, we also perform pointer numbering during the local scan,
       assigning every Def a unique integer and caching the integer for each
       derived pointer. This allows us to operate only on the set of Defs (
-      represented by these integers) for the reset of the algorithm. We also
+      represented by these integers) for the rest of the algorithm. We also
       maintain some local utility information that is needed by later passes
       (see the BBState struct for details).
 
@@ -106,7 +107,7 @@ using namespace llvm;
       step. Now graph coloring in general is a hard problem. However, for SSA
       form programs, (and most programs in general, by virtue of their
       structure), the resulting interference graphs are chordal and can be
-      colored optimizally in linear time by performing greedy coloring in a
+      colored optimally in linear time by performing greedy coloring in a
       perfect elimination order. Now, our interference graphs are likely not
       entirely chordal due to some non-SSA corner cases. However, using the same
       algorithm should still give a very good coloring while having sufficiently
@@ -123,7 +124,7 @@ using namespace llvm;
       at that call in some gc slot, we can attempt to rearrange the slots within
       the gc-frame, or re-use slots not assigned at that particular location
       for the gcframe. However, even without this optimization, stack frames
-      are at most two times larger than optimial (because regular stack coloring
+      are at most two times larger than optimal (because regular stack coloring
       can merge the jlcall allocas).
 
       N.B.: This step is not yet implemented.
@@ -133,7 +134,7 @@ using namespace llvm;
       This performs the actual insertion of the GCFrame pushes/pops, zeros out
       the gc frame and creates the stores to the gc frame according to the
       stack slot assignment computed in the previous step. GC frames stores
-      are generally sunk to right before the first safe point that use them
+      are generally sunk right before the first safe point that use them
       (this is beneficial for code where the primary path does not have
       safepoints, but some other path - e.g. the error path does). However,
       if the first safepoint is not dominated by the definition (this can
@@ -350,7 +351,8 @@ static bool isSpecialPtrVec(Type *Ty) {
 }
 
 static bool isUnionRep(Type *Ty) {
-    return Ty->isStructTy() && isSpecialPtr(cast<StructType>(Ty)->getTypeAtIndex((unsigned)0));
+    return Ty->isStructTy() && cast<StructType>(Ty)->getNumElements() == 2 &&
+        isSpecialPtr(cast<StructType>(Ty)->getTypeAtIndex((unsigned)0));
 }
 
 static Value *FindBaseValue(const State &S, Value *V, bool UseCache = true) {
@@ -679,7 +681,7 @@ static void dumpBitVectorValues(State &S, BitVector &BV) {
 }
 
 /* Debugging utility to dump liveness information */
-__attribute__((used)) static void dumpLivenessState(Function &F, State &S) {
+JL_USED_FUNC static void dumpLivenessState(Function &F, State &S) {
     for (auto &BB : F) {
         dbgs() << "Liveness analysis for BB " << BB.getName();
         dbgs() << "\n\tDefs: ";
@@ -788,12 +790,12 @@ State LateLowerGCFrame::LocalScan(Function &F) {
                                 else {
                                     PHINode *Lift = PHINode::Create(T_prjlvalue, 0, "partiallift", Phi);
                                     for (unsigned i = 0; i < Phi->getNumIncomingValues(); ++i) {
-                                        BasicBlock *IncombingBB = Phi->getIncomingBlock(i);
-                                        if (DT.dominates(cast<Instruction>(Val), IncombingBB->getTerminator())) {
-                                            Lift->addIncoming(Val, IncombingBB);
-                                            NoteUse(S, S.BBStates[IncombingBB], Val, S.BBStates[IncombingBB].PhiOuts);
+                                        BasicBlock *IncomingBB = Phi->getIncomingBlock(i);
+                                        if (DT.dominates(cast<Instruction>(Val), IncomingBB->getTerminator())) {
+                                            Lift->addIncoming(Val, IncomingBB);
+                                            NoteUse(S, S.BBStates[IncomingBB], Val, S.BBStates[IncomingBB].PhiOuts);
                                         } else {
-                                            Lift->addIncoming(ConstantPointerNull::get(cast<PointerType>(T_prjlvalue)), IncombingBB);
+                                            Lift->addIncoming(ConstantPointerNull::get(cast<PointerType>(T_prjlvalue)), IncomingBB);
                                         }
                                     }
                                     NoteUse(S, BBS, Lift);
@@ -987,23 +989,24 @@ void LateLowerGCFrame::ComputeLiveSets(Function &F, State &S) {
     }
     // Compute Rooting Locations
     for (auto &BB : F) {
-        if (S.BBStates[&BB].HasSafepoint) {
-            BitVector UnrootedIn = S.BBStates[&BB].UnrootedIn;
+        BBState &BBS = S.BBStates[&BB];
+        if (BBS.HasSafepoint) {
+            BitVector UnrootedIn = BBS.UnrootedIn;
             // Only those values that have uses after a safepoint or are live
-            // across need to be rooted. N.B. We're explicitl not oring in
+            // across need to be rooted. N.B. We're explicitly not or-ing in
             // UpExposedUsesUnrooted
-            BitVector Mask = S.BBStates[&BB].UpExposedUses;
-            Mask |= S.BBStates[&BB].LiveOut;
-            Mask &= S.BBStates[&BB].LiveIn;
+            BitVector Mask = BBS.UpExposedUses;
+            Mask |= BBS.LiveOut;
+            Mask &= BBS.LiveIn;
             UnrootedIn &= Mask;
             for (int Idx = UnrootedIn.find_first(); Idx >= 0; Idx = UnrootedIn.find_next(Idx)) {
-                S.Rootings[S.BBStates[&BB].TopmostSafepoint].insert(Idx);
+                S.Rootings[BBS.TopmostSafepoint].insert(Idx);
             }
             // Backfill any interior rootings
-            BitVector Interior = S.BBStates[&BB].UnrootedOut;
+            BitVector Interior = BBS.UnrootedOut;
             Interior.flip();
-            Interior &= S.BBStates[&BB].LiveOut;
-            Interior &= S.BBStates[&BB].Defs;
+            Interior &= BBS.LiveOut;
+            Interior &= BBS.Defs;
             for (int Idx = Interior.find_first(); Idx >= 0; Idx = Interior.find_next(Idx)) {
                 // Needs to be rooted at the first safepoint after the def
                 Instruction *Def = cast<Instruction>(S.ReversePtrNumbering[Idx]);
@@ -1023,7 +1026,7 @@ void LateLowerGCFrame::ComputeLiveSets(Function &F, State &S) {
 
 /* For chordal interference graphs, this class gives the verticies in a (reverse
  * - depending on definition) perfect elimination ordering, in such a way that
- * greedy coloring gives an optimial coloring. Since our roots are in SSA form,
+ * greedy coloring gives an optimal coloring. Since our roots are in SSA form,
  * the interference should be chordal.
  */
 struct PEOIterator {
@@ -1083,15 +1086,16 @@ struct PEOIterator {
 
 std::vector<int> LateLowerGCFrame::ColorRoots(const State &S) {
     std::vector<int> Colors;
-    for (int i = 0; i <= S.MaxPtrNumber; ++i)
-        Colors.push_back(-1);
+    Colors.resize(S.MaxPtrNumber + 1, -1);
     PEOIterator Ordering(S.Neighbors);
     /* Greedy coloring */
     int ActiveElement = 1;
     int MaxAssignedColor = -1;
+    BitVector UsedColors;
     while ((ActiveElement = Ordering.next()) != -1) {
         assert(Colors[ActiveElement] == -1);
-        BitVector UsedColors(MaxAssignedColor + 2, false);
+        UsedColors.resize(MaxAssignedColor + 2, false);
+        UsedColors.reset();
         for (int Neighbor : S.Neighbors[ActiveElement]) {
             if (Colors[Neighbor] == -1)
                 continue;
@@ -1165,15 +1169,8 @@ bool LateLowerGCFrame::CleanupIR(Function &F) {
                 ++it;
                 continue;
             } else {
-                SmallVector<Value *, 8> CallArgs;
-                for (auto &op : CI->arg_operands())
-                    CallArgs.push_back(op.get());
-                CallInst *NewCall = CallInst::Create(
-                    CI->getCalledValue(), CallArgs, "", CI
-                );
+                CallInst *NewCall = CallInst::Create(CI, None, CI);
                 NewCall->takeName(CI);
-                NewCall->setDebugLoc(CI->getDebugLoc());
-                NewCall->setAttributes(CI->getAttributes());
                 CI->replaceAllUsesWith(NewCall);
             }
             it = CI->eraseFromParent();
@@ -1187,7 +1184,7 @@ static Value *GetPtrForNumber(State &S, unsigned Num, Instruction *InsertionPoin
 {
     Value *Val = S.ReversePtrNumbering[Num];
     if (isSpecialPtrVec(Val->getType())) {
-        const std::vector<int> AllNums = S.AllVectorNumbering[Val];
+        const std::vector<int> &AllNums = S.AllVectorNumbering[Val];
         unsigned Idx = 0;
         for (; Idx < AllNums.size(); ++Idx) {
             if ((unsigned)AllNums[Idx] == Num)
