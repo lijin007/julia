@@ -266,6 +266,7 @@ void addOptimizationPasses(PassManager *PM)
     PM->add(createLoopVectorizePass());         // Vectorize loops
     PM->add(createInstructionCombiningPass());  // Clean up after loop vectorizer
 #endif
+    PM->add(createCombineMulAddPass());
 }
 
 #ifdef USE_ORCJIT
