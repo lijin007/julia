@@ -411,12 +411,15 @@ function rand!{T}(r::AbstractRNG, A::AbstractArray{T})
     A
 end
 
-function rand!(r::AbstractRNG, A::AbstractArray, s::Union{Associative,AbstractSet})
+function rand!(r::AbstractRNG, A::AbstractArray, s::Union{Set,IntSet,Dict})
     for i in eachindex(A)
         @inbounds A[i] = rand(r, s)
     end
     A
 end
+
+# avoid linear complexity for repeated calls with generic containers
+rand!(r::AbstractRNG, A::AbstractArray, s::Union{Associative,AbstractSet}) = rand!(r, A, collect(s))
 
 rand!(A::AbstractArray, s::Union{Associative,AbstractSet}) = rand!(GLOBAL_RNG, A, s)
 
