@@ -73,7 +73,9 @@ private:
     /// If present, the annotation is an MDNode attached to an instruction in the loop's latch.
     bool hasSIMDLoopMetadata( Loop *L) const;
 
-    /// If Phi is part of a reduction cycle of FAdd or FMul, mark the ops as permitting reassociation/commuting.
+    /// If Phi is part of a reduction cycle of FAdd, FSub, FMul or FDiv,
+    /// mark the ops as permitting reassociation/commuting.
+    /// As of LLVM 4.0, FDiv is not handled by the loop vectorizer
     void enableUnsafeAlgebraIfReduction(PHINode *Phi, Loop *L) const;
 };
 
@@ -129,7 +131,10 @@ void LowerSIMDLoop::enableUnsafeAlgebraIfReduction(PHINode *Phi, Loop *L) const
         else {
             // First arithmetic op in the chain.
             opcode = J->getOpcode();
-            if (opcode!=Instruction::FAdd && opcode!=Instruction::FMul) {
+            if (opcode != Instruction::FAdd && opcode != Instruction::FMul &&
+                opcode != Instruction::FSub && opcode != Instruction::FDiv) {
+                // In principle only fsub and fdiv of one order matters though that's harder
+                // to test...
                 DEBUG(dbgs() << "LSL: first arithmetic op in chain is uninteresting" << *J << "\n");
                 return;
             }
