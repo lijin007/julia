@@ -30,9 +30,10 @@ extern "C" {
 
 // hash of definitions for predefined tagged object
 static htable_t sertag_table;
+static htable_t symbol_table;
 static uintptr_t nsym_tag;
 // array of definitions for the predefined tagged object types
-// (reverse of sertag_table)
+// (reverse of sertag_table and symbol_table)
 static arraylist_t deser_tag;
 static arraylist_t deser_sym;
 
@@ -90,12 +91,14 @@ typedef struct {
 static jl_value_t *jl_idtable_type = NULL;
 static arraylist_t builtin_typenames;
 
-static uintptr_t _Binding_tag;
-static uintptr_t _ConstData_tag;
-static uintptr_t _Symbol_tag;
-static jl_value_t *Binding_tag = (jl_value_t*)&_Binding_tag;
-static jl_value_t *ConstData_tag = (jl_value_t*)&_ConstData_tag;
-static jl_value_t *Symbol_tag = (jl_value_t*)&_Symbol_tag;
+enum RefTags {
+    DataRef,
+    ConstDataRef,
+    TagRef,
+    SymbolRef,
+    BindingRef
+};
+
 
 /* read and write in network (bigendian) order: */
 
@@ -255,8 +258,9 @@ static void jl_serialize_value_(jl_serializer_state *s, jl_value_t *v)
         return;
     }
 
-    size_t item = backref_table_numel++;
-    char *pos = (char*)HT_NOTFOUND + 1 + item;
+    size_t item = ++backref_table_numel;
+    assert(item < (1 << 28) && "too many items to serialize");
+    char *pos = (char*)HT_NOTFOUND + item;
     *bp = (void*)pos;
 
     // some values have special representations
@@ -344,23 +348,28 @@ static void write_pointer(ios_t *s)
 #define backref_id(s, v) _backref_id(s, (jl_value_t*)(v))
 static size_t _backref_id(jl_serializer_state *s, jl_value_t *v)
 {
-    void *idx;
     assert(v != NULL && "cannot get backref to NULL object");
-    idx = ptrhash_get(&sertag_table, v);
-    if (idx == HT_NOTFOUND && jl_is_symbol(v)) {
-        size_t l = strlen(jl_symbol_name((jl_sym_t*)v));
-        write_uint32(s->symbols, l);
-        ios_write(s->symbols, jl_symbol_name((jl_sym_t*)v), l + 1);
-        assert(nsym_tag < (1 << 22) && "too many symbols");
-        uintptr_t Symbol_idx = (uintptr_t)ptrhash_get(&sertag_table, Symbol_tag);
-        idx = (void*)(Symbol_idx + (nsym_tag++ << 8));
-        ptrhash_put(&sertag_table, (void*)v, idx);
+    void *idx = HT_NOTFOUND;
+    if (jl_is_symbol(v)) {
+        void **pidx = ptrhash_bp(&symbol_table, v);
+        idx = *pidx;
+        if (idx == HT_NOTFOUND) {
+            size_t l = strlen(jl_symbol_name((jl_sym_t*)v));
+            write_uint32(s->symbols, l);
+            ios_write(s->symbols, jl_symbol_name((jl_sym_t*)v), l + 1);
+            uintptr_t offset = ++nsym_tag;
+            assert(offset < (1 << 28) && "too many symbols");
+            idx = (void*)((char*)HT_NOTFOUND + (SymbolRef << 28) + offset);
+            *pidx = idx;
+        }
     }
-    if (idx != HT_NOTFOUND) {
-        return ~((char*)idx - 1 - (char*)HT_NOTFOUND);
+    else {
+        idx = ptrhash_get(&sertag_table, v);
     }
-    idx = ptrhash_get(&backref_table, v);
-    assert(idx != HT_NOTFOUND && "object missed during jl_serialize_value pass");
+    if (idx == HT_NOTFOUND) {
+        idx = ptrhash_get(&backref_table, v);
+        assert(idx != HT_NOTFOUND && "object missed during jl_serialize_value pass");
+    }
     return (char*)idx - 1 - (char*)HT_NOTFOUND;
 }
 
@@ -374,11 +383,10 @@ static void write_pointerfield(jl_serializer_state *s, jl_value_t *fld)
     write_pointer(s->s);
 }
 
-static void write_gctaggedfield(jl_serializer_state *s, jl_value_t *fld)
+static void write_gctaggedfield(jl_serializer_state *s, uintptr_t ref)
 {
-    assert(fld != NULL);
     arraylist_push(&s->gctags_list, (void*)ios_pos(s->s));
-    arraylist_push(&s->gctags_list, (void*)backref_id(s, fld));
+    arraylist_push(&s->gctags_list, (void*)ref);
     write_pointer(s->s);
 }
 
@@ -408,10 +416,10 @@ static void jl_write_module(jl_serializer_state *s, uintptr_t item, jl_module_t 
         if (table[i] != HT_NOTFOUND) {
             jl_binding_t *b = (jl_binding_t*)table[i];
             if (b->owner == m || m != jl_main_module) {
-                write_gctaggedfield(s, Binding_tag);
+                write_gctaggedfield(s, BindingRef << 28);
                 tot += sizeof(void*);
                 size_t binding_reloc_offset = ios_pos(s->s);
-                record_gvar(s, jl_get_llvm_gv((jl_value_t*)b), binding_reloc_offset);
+                record_gvar(s, jl_get_llvm_gv((jl_value_t*)b), (DataRef << 28) + binding_reloc_offset);
                 write_pointerfield(s, (jl_value_t*)b->name);
                 write_pointerfield(s, b->value);
                 write_pointerfield(s, b->globalref);
@@ -436,7 +444,7 @@ static void jl_write_module(jl_serializer_state *s, uintptr_t item, jl_module_t 
         newm->usings.max = AL_N_INLINE;
         newm->usings.items = (void**)offsetof(jl_module_t, usings._space);
         arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_module_t, usings.items)));
-        arraylist_push(&s->relocs_list, (void*)item);
+        arraylist_push(&s->relocs_list, (void*)((DataRef << 28) + item));
         arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_module_t, usings._space[0])));
         arraylist_push(&s->relocs_list, (void*)backref_id(s, jl_core_module));
     }
@@ -445,7 +453,7 @@ static void jl_write_module(jl_serializer_state *s, uintptr_t item, jl_module_t 
             m->usings.max = AL_N_INLINE;
             newm->usings.items = (void**)offsetof(jl_module_t, usings._space);
             arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_module_t, usings.items)));
-            arraylist_push(&s->relocs_list, (void*)item);
+            arraylist_push(&s->relocs_list, (void*)((DataRef << 28) + item));
             size_t i;
             for (i = 0; i < m->usings.len; i++) {
                 arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_module_t, usings._space[i])));
@@ -455,7 +463,7 @@ static void jl_write_module(jl_serializer_state *s, uintptr_t item, jl_module_t 
         else {
             newm->usings.items = (void**)tot;
             arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_module_t, usings.items)));
-            arraylist_push(&s->relocs_list, (void*)item);
+            arraylist_push(&s->relocs_list, (void*)((DataRef << 28) + item));
             size_t i;
             for (i = 0; i < m->usings.len; i++) {
                 write_pointerfield(s, (jl_value_t*)m->usings.items[i]);
@@ -540,11 +548,11 @@ static void jl_write_values(jl_serializer_state *s)
         uintptr_t skip_header_pos = ios_pos(s->s) + sizeof(jl_taggedvalue_t);
         write_padding(s->s, LLT_ALIGN(skip_header_pos, 16) - skip_header_pos);
         // write header
-        write_gctaggedfield(s, (jl_value_t*)t);
+        write_gctaggedfield(s, backref_id(s, t));
         size_t reloc_offset = ios_pos(s->s);
         assert(item < layout_table.len && layout_table.items[item] == NULL);
         layout_table.items[item] = (void*)reloc_offset;
-        record_gvar(s, jl_get_llvm_gv(v), reloc_offset);
+        record_gvar(s, jl_get_llvm_gv(v), (DataRef << 28) + reloc_offset);
 
         // write data
         if (jl_is_cpointer(v)) {
@@ -576,9 +584,9 @@ static void jl_write_values(jl_serializer_state *s)
                 // write data and relocations
                 newa->data = NULL; // relocation offset
                 data /= sizeof(void*);
-                assert(data < (1 << 22) && "offset to constant data too large");
+                assert(data < (1 << 28) && "offset to constant data too large");
                 arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_array_t, data))); // relocation location
-                arraylist_push(&s->relocs_list, (void*)~(~backref_id(s, ConstData_tag) + (data << 8))); // relocation target
+                arraylist_push(&s->relocs_list, (void*)((ConstDataRef << 28) + data)); // relocation target
                 if (ar->elsize == 1)
                     tot += 1;
                 ios_write(s->const_data, (char*)jl_array_data(ar), tot);
@@ -586,7 +594,7 @@ static void jl_write_values(jl_serializer_state *s)
             else {
                 newa->data = (void*)tsz; // relocation offset
                 arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_array_t, data))); // relocation location
-                arraylist_push(&s->relocs_list, (void*)item); // relocation target
+                arraylist_push(&s->relocs_list, (void*)((DataRef << 28) + item)); // relocation target
                 size_t i;
                 for (i = 0; i < alen; i++) {
                     write_pointerfield(s, jl_array_ptr_ref(v, i));
@@ -717,7 +725,7 @@ static void jl_write_values(jl_serializer_state *s)
                     newdt->layout = NULL; // relocation offset
                     layout /= sizeof(void*);
                     arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_datatype_t, layout))); // relocation location
-                    arraylist_push(&s->relocs_list, (void*)~(~backref_id(s, ConstData_tag) + (layout << 8))); // relocation target
+                    arraylist_push(&s->relocs_list, (void*)((ConstDataRef << 28) + layout)); // relocation target
                     ios_write(s->const_data, flddesc, fldsize);
                 }
             }
@@ -741,7 +749,7 @@ static void jl_write_gv_syms(jl_serializer_state *s, jl_sym_t *v)
     int32_t gv = jl_get_llvm_gv((jl_value_t*)v);
     if (gv != 0) {
         uintptr_t item = backref_id(s, v);
-        assert(item & ((uintptr_t)1 << (8 * sizeof(uintptr_t) - 1)));
+        assert(item >> 28 == SymbolRef);
         record_gvar(s, gv, item);
     }
     if (v->left)
@@ -779,41 +787,62 @@ static void jl_read_symbols(jl_serializer_state *s)
 
 static uintptr_t get_reloc_for_item(size_t reloc_item, size_t reloc_offset)
 {
-    if (reloc_item & ((uintptr_t)1 << (8 * sizeof(uintptr_t) - 1))) {
-        // if high bit is set this is a builtin object,
-        // so we just write the item reloc_id directly
-        assert(reloc_offset == 0 && "offsets for relocations to builtin objects should be precomposed in the reloc_item");
-        assert(~reloc_item >= 2 && "corrupt relocation item id");
-        return reloc_item; // pre-composed relocation + offset
-    }
-    else {
+    enum RefTags tag = (enum RefTags)(reloc_item >> 28);
+    if (tag == DataRef) {
+        // need to compute the final relocation offset via the layout table
         assert(reloc_item < layout_table.len);
         uintptr_t reloc_base = (uintptr_t)layout_table.items[reloc_item];
         assert(reloc_base != 0 && "layout offset missing for relocation item");
         // write reloc_offset into s->s at pos
         return reloc_base + reloc_offset;
     }
+    else {
+        // just write the item reloc_id directly
+#ifndef NDEBUG
+        assert(reloc_offset == 0 && "offsets for relocations to builtin objects should be precomposed in the reloc_item");
+        uintptr_t offset = (reloc_item & ((1u << 28) - 1));
+        switch (tag) {
+        case ConstDataRef:
+            break;
+        case TagRef:
+            assert(offset >= 2 && offset < deser_tag.len && deser_tag.items[offset] && "corrupt relocation item id");
+            break;
+        case SymbolRef:
+            assert(offset < nsym_tag && "corrupt relocation item id");
+            break;
+        case BindingRef:
+            assert(offset == 0 && "corrupt relocation offset");
+            break;
+        case DataRef:
+        default:
+            assert("corrupt relocation item id");
+        }
+#endif
+        return reloc_item; // pre-composed relocation + offset
+    }
 }
 
 
 static inline uintptr_t get_item_for_reloc(jl_serializer_state *s, uintptr_t base, size_t size, uintptr_t reloc_id)
 {
-    if (reloc_id & ((uintptr_t)1 << (8 * sizeof(uintptr_t) - 1))) {
-        // if high bit is set this is a builtin object
-        reloc_id = ~reloc_id;
-        uint8_t idx = reloc_id & 0xFF;
-        uintptr_t offset = ((reloc_id >> 8) & 0xFFFFFF);
-        assert(idx >= 2 && idx < deser_tag.len && deser_tag.items[idx] && "corrupt relocation item id");
-        uintptr_t v = (uintptr_t)deser_tag.items[idx];
-        if (v == (uintptr_t)Symbol_tag)
-            return (uintptr_t)deser_sym.items[offset];
-        return v + (offset * sizeof(void*));
+    enum RefTags tag = (enum RefTags)(reloc_id >> 28);
+    uintptr_t offset = (reloc_id & ((1u << 28) - 1));
+    switch (tag) {
+    case DataRef:
+        assert(offset < size);
+        return base + offset;
+    case ConstDataRef:
+        return (uintptr_t)deser_tag.items[0] + (offset * sizeof(void*));
+    case TagRef:
+        assert(offset < deser_tag.len && deser_tag.items[offset] && "corrupt relocation item id");
+        return (uintptr_t)deser_tag.items[offset];
+    case SymbolRef:
+        assert(offset < deser_sym.len && deser_sym.items[offset] && "corrupt relocation item id");
+        return (uintptr_t)deser_sym.items[offset];
+    case BindingRef:
+        return jl_buff_tag | GC_OLD_MARKED;
     }
-    else {
-        assert(reloc_id < size);
-        reloc_id += base;
-        return reloc_id;
-    }
+    abort();
 }
 
 
@@ -1049,7 +1078,6 @@ static void jl_reinit_item(jl_value_t *v, int how, arraylist_t *tracee_list)
                 } *b;
                 b = (struct binding*)&mod[1];
                 while (nbindings > 0) {
-                    b->tag = jl_buff_tag | GC_OLD_MARKED;
                     ptrhash_put(&mod->bindings, (char*)b->b.name, &b->b);
                     b += 1;
                     nbindings -= 1;
@@ -1132,7 +1160,7 @@ static void jl_save_system_image_to_stream(ios_t *f)
     jl_gc_collect(0); // incremental (sweep finalizers)
     JL_TIMING(SYSIMG_DUMP);
     int en = jl_gc_enable(0);
-    jl_init_serializer2(0);
+    jl_init_serializer2(1);
     htable_reset(&backref_table, 250000);
     arraylist_new(&reinit_list, 0);
     backref_table_numel = 0;
@@ -1195,16 +1223,11 @@ static void jl_save_system_image_to_stream(ios_t *f)
         jl_write_values(&s);
         jl_write_relocations(&s);
         jl_write_gv_syms(&s, jl_get_root_symbol());
-        // ensure everything in deser_tag and non-symbols in deser_sym are reassociated with their GlobalValue
+        // ensure everything in deser_tag are reassociated with their GlobalValue
         uintptr_t i;
-        for (i = 2; i < deser_tag.len; i++) {
+        for (i = 0; i < deser_tag.len; i++) {
             jl_value_t *v = (jl_value_t*)deser_tag.items[i];
-            record_gvar(&s, jl_get_llvm_gv(v), ~(uintptr_t)i);
-        }
-        uintptr_t Symbol_idx = (uintptr_t)ptrhash_get(&sertag_table, Symbol_tag);
-        for (i = 0; i < deser_sym.len; i++) {
-            jl_value_t *v = (jl_value_t*)deser_sym.items[i];
-            record_gvar(&s, jl_get_llvm_gv(v), ~(Symbol_idx - 1 - (uintptr_t)HT_NOTFOUND + (i << 8)));
+            record_gvar(&s, jl_get_llvm_gv(v), (TagRef << 28) + i);
         }
     }
 
@@ -1331,7 +1354,7 @@ static void jl_restore_system_image_from_stream(ios_t *f)
     JL_TIMING(SYSIMG_LOAD);
     jl_ptls_t ptls = jl_get_ptls_states();
     int en = jl_gc_enable(0);
-    jl_init_serializer2(1);
+    jl_init_serializer2(0);
     ios_t sysimg, const_data, symbols, relocs, gvar_record, fptr_record;
     jl_serializer_state s;
     s.s = &sysimg;
@@ -1384,7 +1407,7 @@ static void jl_restore_system_image_from_stream(ios_t *f)
     sysimg_relocs = &relocs.buf[0];
     jl_gc_set_permalloc_region((void*)sysimg_base, (void*)(sysimg_base + sysimg.size));
 
-    deser_tag.items[~backref_id(&s, ConstData_tag)] = (void*)const_data.buf;
+    deser_tag.items[0] = (void*)const_data.buf;
     jl_read_relocations(&s, GC_OLD_MARKED); // gctags
     size_t sizeof_tags = ios_pos(&relocs);
     jl_read_relocations(&s, 0); // general relocs
@@ -1515,17 +1538,23 @@ JL_DLLEXPORT void jl_restore_system_image_data(const char *buf, size_t len)
 
 void jl_gc_force_mark_old(jl_ptls_t ptls, jl_value_t *v);
 
-static void jl_init_serializer2(int for_deserialize)
+static void jl_init_serializer2(int for_serialize)
 {
     jl_ptls_t ptls = jl_get_ptls_states();
-    htable_new(&sertag_table, 0);
-    htable_new(&fptr_to_id, sizeof(id_to_fptrs) / sizeof(*id_to_fptrs));
-    htable_new(&backref_table, 0);
-    arraylist_new(&deser_tag, 0);
-    arraylist_new(&deser_sym, 0);
     arraylist_new(&builtin_typenames, 0);
+    if (for_serialize) {
+        htable_new(&sertag_table, 0);
+        htable_new(&symbol_table, 0);
+        htable_new(&fptr_to_id, sizeof(id_to_fptrs) / sizeof(*id_to_fptrs));
+        htable_new(&backref_table, 0);
+    }
+    else {
+        arraylist_new(&deser_tag, 0);
+        arraylist_new(&deser_sym, 0);
+    }
+    uintptr_t i;
 
-    void *tags[] = { ptls->root_task, Binding_tag, ConstData_tag, Symbol_tag,
+    void *tags[] = { ptls->root_task,
                      jl_symbol_type, jl_ssavalue_type, jl_datatype_type, jl_slotnumber_type,
                      jl_simplevector_type, jl_array_type, jl_typedslot_type,
                      jl_expr_type, jl_globalref_type, jl_string_type,
@@ -1569,23 +1598,29 @@ static void jl_init_serializer2(int for_deserialize)
 
                      NULL };
 
-    uintptr_t i = 2;
     arraylist_push(&deser_tag, NULL);
     arraylist_push(&deser_tag, NULL);
-    while (tags[i - 2] != NULL) {
-        void *v = tags[i - 2];
-        if (for_deserialize && v != Binding_tag && v != ConstData_tag && v != Symbol_tag) {
+    for (i = 0; tags[i] != NULL; i++) {
+        void *v = tags[i];
+        if (!for_serialize) {
             // some builtins are only rooted through a type cache or Main.Core binding,
             // but were allocated young, so we force the gc to change their tag here
             jl_gc_force_mark_old(ptls, (jl_value_t*)v);
         }
-        ptrhash_put(&sertag_table, v, (char*)HT_NOTFOUND + 1 + i);
-        assert(deser_tag.len == i);
-        arraylist_push(&deser_tag, v);
-        i += 1;
+        if (jl_is_symbol(v)) {
+            arraylist_push(&deser_sym, v);
+            if (for_serialize)
+                ptrhash_put(&symbol_table, v, (void*)((char*)HT_NOTFOUND + (SymbolRef << 28) + deser_sym.len));
+        }
+        else {
+            arraylist_push(&deser_tag, v);
+            if (for_serialize)
+                ptrhash_put(&sertag_table, v, (void*)((char*)HT_NOTFOUND + (TagRef << 28) + deser_tag.len));
+        }
     }
-    assert(i - 1 == sizeof(tags) / sizeof(tags[0]) && ptrhash_get(&sertag_table, ptls->root_task) != HT_NOTFOUND);
-    assert(i < 0xFF);
+    assert(i + 1 == sizeof(tags) / sizeof(tags[0]));
+    assert(!for_serialize || ptrhash_get(&sertag_table, ptls->root_task) == (char*)HT_NOTFOUND + (TagRef << 28) + 3);
+    nsym_tag = deser_sym.len;
 
     // this also ensures all objects referenced in the code have
     // references in the system image to their global variable
@@ -1593,22 +1628,24 @@ static void jl_init_serializer2(int for_deserialize)
     // they might not have had a reference anywhere in the code
     // image other than here
 #define NBOX_C 1024
-    nsym_tag = 0;
-    uintptr_t Symbol_idx = (uintptr_t)ptrhash_get(&sertag_table, Symbol_tag);
     for (i = 0; i < NBOX_C; i++) {
         jl_value_t *v32 = jl_box_int32(i - NBOX_C / 2);
-        ptrhash_put(&sertag_table, v32, (void*)(Symbol_idx + (nsym_tag++ << 8)));
-        arraylist_push(&deser_sym, v32);
+        arraylist_push(&deser_tag, v32);
+        if (for_serialize)
+            ptrhash_put(&sertag_table, v32, (void*)((char*)HT_NOTFOUND + (TagRef << 28) + deser_tag.len));
 
         jl_value_t *v64 = jl_box_int64(i - NBOX_C / 2);
-        ptrhash_put(&sertag_table, v64, (void*)(Symbol_idx + (nsym_tag++ << 8)));
-        arraylist_push(&deser_sym, v64);
+        arraylist_push(&deser_tag, v64);
+        if (for_serialize)
+            ptrhash_put(&sertag_table, v64, (void*)((char*)HT_NOTFOUND + (TagRef << 28) + deser_tag.len));
     }
 
-    i = 2;
-    while (id_to_fptrs[i] != NULL) {
-        ptrhash_put(&fptr_to_id, (void*)(uintptr_t)id_to_fptrs[i], (void*)i);
-        i += 1;
+    if (for_serialize) {
+        i = 2;
+        while (id_to_fptrs[i] != NULL) {
+            ptrhash_put(&fptr_to_id, (void*)(uintptr_t)id_to_fptrs[i], (void*)i);
+            i += 1;
+        }
     }
 
     arraylist_push(&builtin_typenames, jl_array_typename);
@@ -1624,6 +1661,7 @@ static void jl_init_serializer2(int for_deserialize)
 static void jl_cleanup_serializer2(void)
 {
     htable_reset(&sertag_table, 0);
+    htable_reset(&symbol_table, 0);
     htable_reset(&fptr_to_id, 0);
     htable_reset(&backref_table, 0);
     arraylist_free(&deser_tag);
