@@ -171,10 +171,44 @@ end
     throw(ArgumentError("invalid base: base must be 2 ≤ base ≤ 62, got $base"))
 end
 
+
+"""
+    tryparse(type, str, [base])
+
+Like [`parse`](@ref), but returns a [`Nullable`](@ref) of the requested type. The result will be null if the
+string does not contain a valid number.
+"""
+function tryparse end
+
 tryparse(::Type{T}, s::AbstractString, base::Integer) where {T<:Integer} =
     tryparse_internal(T, s, start(s), endof(s), check_valid_base(base), false)
 tryparse(::Type{T}, s::AbstractString) where {T<:Integer} =
     tryparse_internal(T, s, start(s), endof(s), 0, false)
+
+
+"""
+    parse(type, str, [base])
+
+Parse a string as a number. If the type is an integer type, then a base can be specified
+(the default is 10). If the type is a floating point type, the string is parsed as a decimal
+floating point number. If the string does not contain a valid number, an error is raised.
+
+```jldoctest
+julia> parse(Int, "1234")
+1234
+
+julia> parse(Int, "1234", 5)
+194
+
+julia> parse(Int, "afc", 16)
+2812
+
+julia> parse(Float64, "1.2e-3")
+0.0012
+```
+"""
+function parse(T::Type, str, base=Int) end
+
 
 function parse(::Type{T}, s::AbstractString, base::Integer) where T<:Integer
     get(tryparse_internal(T, s, start(s), endof(s), check_valid_base(base), true))
@@ -211,6 +245,28 @@ float(a::AbstractArray{<:AbstractString}) = map!(float, similar(a,typeof(float(0
 
 ## interface to parser ##
 
+"""
+    parse(str, start; greedy=true, raise=true) -> (Expr, Int)
+
+Parse the expression string and return an expression (which could later be passed to eval
+for execution). `start` is the index of the first character to start parsing. If `greedy` is
+`true` (default), `parse` will try to consume as much input as it can; otherwise, it will
+stop as soon as it has parsed a valid expression. Incomplete but otherwise syntactically
+valid expressions will return `Expr(:incomplete, "(error message)")`. If `raise` is `true`
+(default), syntax errors other than incomplete expressions will raise an error. If `raise`
+is `false`, `parse` will return an expression that will raise an error upon evaluation.
+
+```jldoctest
+julia> parse("x = 3, y = 5", 7)
+(:(y = 5), 13)
+
+julia> parse("x = 3, y = 5", 5)
+(:((3, y) = 5), 13)
+```
+"""
+parse(str, start)
+
+
 function parse(str::AbstractString, pos::Int; greedy::Bool=true, raise::Bool=true)
     # pos is one based byte offset.
     # returns (expr, end_pos). expr is () in case of parse error.
@@ -227,6 +283,33 @@ function parse(str::AbstractString, pos::Int; greedy::Bool=true, raise::Bool=tru
     end
     return ex, pos+1 # C is zero-based, Julia is 1-based
 end
+
+
+"""
+    parse(str; raise=true) -> Expr
+
+Parse the expression string greedily, returning a single expression. An error is thrown if
+there are additional characters after the first expression. If `raise` is `true` (default),
+syntax errors will raise an error; otherwise, `parse` will return an expression that will
+raise an error upon evaluation.
+
+```jldoctest
+julia> parse("x = 3")
+:(x = 3)
+
+julia> parse("x = ")
+:($(Expr(:incomplete, "incomplete: premature end of input")))
+
+julia> parse("1.0.2")
+ERROR: ParseError("invalid numeric constant \\\"1.0.\\\"")
+Stacktrace:
+  [...]
+
+julia> parse("1.0.2"; raise = false)
+:($(Expr(:error, "invalid numeric constant \"1.0.\"")))
+```
+"""
+parse(str)
 
 function parse(str::AbstractString; raise::Bool=true)
     ex, pos = parse(str, 1, greedy=true, raise=raise)
