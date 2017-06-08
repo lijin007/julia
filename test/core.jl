@@ -4997,3 +4997,8 @@ end
 end
 @test M22026.foofunction(Int16) === Int16
 @test M22026.foofunction2(3) === 6.0f0
+
+# issue #22291
+wrap22291(ind) = (ind...)
+@test @inferred(wrap22291(1)) == (1,)
+@test @inferred(wrap22291((1, 2))) == (1, 2)
