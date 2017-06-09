@@ -850,3 +850,16 @@ for i in 1:3
     ir = sprint(io->code_llvm(io, f22290, Tuple{}))
     @test contains(ir, "julia_f22290")
 end
+
+# ensure _apply can "see-through" SSAValue to infer precise container types
+let f, m
+    f() = 0
+    m = first(methods(f))
+    m.source = Base.uncompressed_ast(m)::CodeInfo
+    m.source.ssavaluetypes = 1
+    m.source.code = Any[
+        Expr(:(=), SSAValue(0), Expr(:call, GlobalRef(Core, :svec), 1, 2, 3)),
+        Expr(:return, Expr(:call, Core._apply, :+, SSAValue(0)))
+    ]
+    @test @inferred(f()) == 6
+end
