@@ -99,6 +99,10 @@ enum RefTags {
     BindingRef
 };
 
+// this supports up to 1 GB images and 16 RefTags
+// if a larger size is required, will need to add support for writing larger relocations in many cases below
+#define RELOC_TAG_OFFSET 28
+
 
 /* read and write in network (bigendian) order: */
 
@@ -259,7 +263,7 @@ static void jl_serialize_value_(jl_serializer_state *s, jl_value_t *v)
     }
 
     size_t item = ++backref_table_numel;
-    assert(item < (1 << 28) && "too many items to serialize");
+    assert(item < ((uintptr_t)1 << RELOC_TAG_OFFSET) && "too many items to serialize");
     char *pos = (char*)HT_NOTFOUND + item;
     *bp = (void*)pos;
 
@@ -316,12 +320,13 @@ static void ios_ensureroom(ios_t *s, size_t newsize)
     }
 }
 
-static void record_gvar(jl_serializer_state *s, int gid, uint32_t reloc_id)
+static void record_gvar(jl_serializer_state *s, int gid, uintptr_t reloc_id)
 {
     if (gid == 0)
         return;
     ios_ensureroom(s->gvar_record, gid * sizeof(uint32_t));
     ios_seek(s->gvar_record, (gid - 1) * sizeof(uint32_t));
+    assert(reloc_id < UINT32_MAX);
     write_uint32(s->gvar_record, reloc_id);
 }
 
@@ -346,7 +351,7 @@ static void write_pointer(ios_t *s)
 
 
 #define backref_id(s, v) _backref_id(s, (jl_value_t*)(v))
-static size_t _backref_id(jl_serializer_state *s, jl_value_t *v)
+static uintptr_t _backref_id(jl_serializer_state *s, jl_value_t *v)
 {
     assert(v != NULL && "cannot get backref to NULL object");
     void *idx = HT_NOTFOUND;
@@ -357,9 +362,9 @@ static size_t _backref_id(jl_serializer_state *s, jl_value_t *v)
             size_t l = strlen(jl_symbol_name((jl_sym_t*)v));
             write_uint32(s->symbols, l);
             ios_write(s->symbols, jl_symbol_name((jl_sym_t*)v), l + 1);
-            uintptr_t offset = ++nsym_tag;
-            assert(offset < (1 << 28) && "too many symbols");
-            idx = (void*)((char*)HT_NOTFOUND + (SymbolRef << 28) + offset);
+            size_t offset = ++nsym_tag;
+            assert(offset < ((uintptr_t)1 << RELOC_TAG_OFFSET) && "too many symbols");
+            idx = (void*)((char*)HT_NOTFOUND + ((uintptr_t)SymbolRef << RELOC_TAG_OFFSET) + offset);
             *pidx = idx;
         }
     }
@@ -416,10 +421,10 @@ static void jl_write_module(jl_serializer_state *s, uintptr_t item, jl_module_t 
         if (table[i] != HT_NOTFOUND) {
             jl_binding_t *b = (jl_binding_t*)table[i];
             if (b->owner == m || m != jl_main_module) {
-                write_gctaggedfield(s, BindingRef << 28);
+                write_gctaggedfield(s, (uintptr_t)BindingRef << RELOC_TAG_OFFSET);
                 tot += sizeof(void*);
                 size_t binding_reloc_offset = ios_pos(s->s);
-                record_gvar(s, jl_get_llvm_gv((jl_value_t*)b), (DataRef << 28) + binding_reloc_offset);
+                record_gvar(s, jl_get_llvm_gv((jl_value_t*)b), ((uintptr_t)DataRef << RELOC_TAG_OFFSET) + binding_reloc_offset);
                 write_pointerfield(s, (jl_value_t*)b->name);
                 write_pointerfield(s, b->value);
                 write_pointerfield(s, b->globalref);
@@ -444,7 +449,7 @@ static void jl_write_module(jl_serializer_state *s, uintptr_t item, jl_module_t 
         newm->usings.max = AL_N_INLINE;
         newm->usings.items = (void**)offsetof(jl_module_t, usings._space);
         arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_module_t, usings.items)));
-        arraylist_push(&s->relocs_list, (void*)((DataRef << 28) + item));
+        arraylist_push(&s->relocs_list, (void*)(((uintptr_t)DataRef << RELOC_TAG_OFFSET) + item));
         arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_module_t, usings._space[0])));
         arraylist_push(&s->relocs_list, (void*)backref_id(s, jl_core_module));
     }
@@ -453,7 +458,7 @@ static void jl_write_module(jl_serializer_state *s, uintptr_t item, jl_module_t 
             m->usings.max = AL_N_INLINE;
             newm->usings.items = (void**)offsetof(jl_module_t, usings._space);
             arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_module_t, usings.items)));
-            arraylist_push(&s->relocs_list, (void*)((DataRef << 28) + item));
+            arraylist_push(&s->relocs_list, (void*)(((uintptr_t)DataRef << RELOC_TAG_OFFSET) + item));
             size_t i;
             for (i = 0; i < m->usings.len; i++) {
                 arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_module_t, usings._space[i])));
@@ -463,7 +468,7 @@ static void jl_write_module(jl_serializer_state *s, uintptr_t item, jl_module_t 
         else {
             newm->usings.items = (void**)tot;
             arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_module_t, usings.items)));
-            arraylist_push(&s->relocs_list, (void*)((DataRef << 28) + item));
+            arraylist_push(&s->relocs_list, (void*)(((uintptr_t)DataRef << RELOC_TAG_OFFSET) + item));
             size_t i;
             for (i = 0; i < m->usings.len; i++) {
                 write_pointerfield(s, (jl_value_t*)m->usings.items[i]);
@@ -552,7 +557,7 @@ static void jl_write_values(jl_serializer_state *s)
         size_t reloc_offset = ios_pos(s->s);
         assert(item < layout_table.len && layout_table.items[item] == NULL);
         layout_table.items[item] = (void*)reloc_offset;
-        record_gvar(s, jl_get_llvm_gv(v), (DataRef << 28) + reloc_offset);
+        record_gvar(s, jl_get_llvm_gv(v), ((uintptr_t)DataRef << RELOC_TAG_OFFSET) + reloc_offset);
 
         // write data
         if (jl_is_cpointer(v)) {
@@ -584,9 +589,9 @@ static void jl_write_values(jl_serializer_state *s)
                 // write data and relocations
                 newa->data = NULL; // relocation offset
                 data /= sizeof(void*);
-                assert(data < (1 << 28) && "offset to constant data too large");
+                assert(data < ((uintptr_t)1 << RELOC_TAG_OFFSET) && "offset to constant data too large");
                 arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_array_t, data))); // relocation location
-                arraylist_push(&s->relocs_list, (void*)((ConstDataRef << 28) + data)); // relocation target
+                arraylist_push(&s->relocs_list, (void*)(((uintptr_t)ConstDataRef << RELOC_TAG_OFFSET) + data)); // relocation target
                 if (ar->elsize == 1)
                     tot += 1;
                 ios_write(s->const_data, (char*)jl_array_data(ar), tot);
@@ -594,7 +599,7 @@ static void jl_write_values(jl_serializer_state *s)
             else {
                 newa->data = (void*)tsz; // relocation offset
                 arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_array_t, data))); // relocation location
-                arraylist_push(&s->relocs_list, (void*)((DataRef << 28) + item)); // relocation target
+                arraylist_push(&s->relocs_list, (void*)(((uintptr_t)DataRef << RELOC_TAG_OFFSET) + item)); // relocation target
                 size_t i;
                 for (i = 0; i < alen; i++) {
                     write_pointerfield(s, jl_array_ptr_ref(v, i));
@@ -662,6 +667,7 @@ static void jl_write_values(jl_serializer_state *s)
                         // save functionObject pointers
                         int cfunc = jl_assign_functionID(m->functionObjectsDecls.specFunctionObject);
                         int func = jl_assign_functionID(m->functionObjectsDecls.functionObject);
+                        assert(reloc_offset < INT32_MAX);
                         if (cfunc != 0) {
                             ios_ensureroom(s->fptr_record, cfunc * sizeof(void*));
                             ios_seek(s->fptr_record, (cfunc - 1) * sizeof(void*));
@@ -725,7 +731,7 @@ static void jl_write_values(jl_serializer_state *s)
                     newdt->layout = NULL; // relocation offset
                     layout /= sizeof(void*);
                     arraylist_push(&s->relocs_list, (void*)(reloc_offset + offsetof(jl_datatype_t, layout))); // relocation location
-                    arraylist_push(&s->relocs_list, (void*)((ConstDataRef << 28) + layout)); // relocation target
+                    arraylist_push(&s->relocs_list, (void*)(((uintptr_t)ConstDataRef << RELOC_TAG_OFFSET) + layout)); // relocation target
                     ios_write(s->const_data, flddesc, fldsize);
                 }
             }
@@ -749,7 +755,7 @@ static void jl_write_gv_syms(jl_serializer_state *s, jl_sym_t *v)
     int32_t gv = jl_get_llvm_gv((jl_value_t*)v);
     if (gv != 0) {
         uintptr_t item = backref_id(s, v);
-        assert(item >> 28 == SymbolRef);
+        assert(item >> RELOC_TAG_OFFSET == SymbolRef);
         record_gvar(s, gv, item);
     }
     if (v->left)
@@ -785,9 +791,9 @@ static void jl_read_symbols(jl_serializer_state *s)
 }
 
 
-static uintptr_t get_reloc_for_item(size_t reloc_item, size_t reloc_offset)
+static uintptr_t get_reloc_for_item(uintptr_t reloc_item, size_t reloc_offset)
 {
-    enum RefTags tag = (enum RefTags)(reloc_item >> 28);
+    enum RefTags tag = (enum RefTags)(reloc_item >> RELOC_TAG_OFFSET);
     if (tag == DataRef) {
         // need to compute the final relocation offset via the layout table
         assert(reloc_item < layout_table.len);
@@ -800,7 +806,7 @@ static uintptr_t get_reloc_for_item(size_t reloc_item, size_t reloc_offset)
         // just write the item reloc_id directly
 #ifndef NDEBUG
         assert(reloc_offset == 0 && "offsets for relocations to builtin objects should be precomposed in the reloc_item");
-        uintptr_t offset = (reloc_item & ((1u << 28) - 1));
+        size_t offset = (reloc_item & (((uintptr_t)1 << RELOC_TAG_OFFSET) - 1));
         switch (tag) {
         case ConstDataRef:
             break;
@@ -823,10 +829,10 @@ static uintptr_t get_reloc_for_item(size_t reloc_item, size_t reloc_offset)
 }
 
 
-static inline uintptr_t get_item_for_reloc(jl_serializer_state *s, uintptr_t base, size_t size, uintptr_t reloc_id)
+static inline uintptr_t get_item_for_reloc(jl_serializer_state *s, uintptr_t base, size_t size, uint32_t reloc_id)
 {
-    enum RefTags tag = (enum RefTags)(reloc_id >> 28);
-    uintptr_t offset = (reloc_id & ((1u << 28) - 1));
+    enum RefTags tag = (enum RefTags)(reloc_id >> RELOC_TAG_OFFSET);
+    size_t offset = (reloc_id & (((uintptr_t)1 << RELOC_TAG_OFFSET) - 1));
     switch (tag) {
     case DataRef:
         assert(offset < size);
@@ -857,6 +863,7 @@ static void jl_write_skiplist(ios_t *s, char *base, size_t size, arraylist_t *li
         *pv = get_reloc_for_item(item, *pv);
         // record pos in relocations list
         // TODO: save space by using delta-compression
+        assert(pos < UINT32_MAX);
         write_uint32(s, pos);
     }
     write_uint32(s, 0);
@@ -912,8 +919,9 @@ static void _jl_write_value(jl_serializer_state *s, jl_value_t *v)
         write_uint32(s->s, 0);
         return;
     }
-    size_t item = backref_id(s, v);
-    uint32_t reloc = get_reloc_for_item(item, 0);
+    uintptr_t item = backref_id(s, v);
+    uintptr_t reloc = get_reloc_for_item(item, 0);
+    assert(reloc < UINT32_MAX);
     write_uint32(s->s, reloc);
 }
 
@@ -923,7 +931,7 @@ static jl_value_t *jl_read_value(jl_serializer_state *s)
     uintptr_t base = (uintptr_t)&s->s->buf[0];
     size_t size = s->s->size;
     uintptr_t val = base + s->s->bpos;
-    size_t offset = (int32_t)load_uint32_be(&val); // sign-extended load
+    uint32_t offset = load_uint32_be(&val);
     s->s->bpos += sizeof(uint32_t);
     if (offset == 0)
         return NULL;
@@ -945,10 +953,10 @@ static void jl_update_all_fptrs(jl_serializer_state *s)
     jl_method_instance_t **linfos = (jl_method_instance_t**)&s->fptr_record->buf[0];
     for (i = 0; i < sysimg_fvars_max; i++) {
         uintptr_t val = (uintptr_t)&linfos[i];
-        size_t offset = (int32_t)load_uint32_be(&val); // sign-extended load
+        uint32_t offset = load_uint32_be(&val);
         if (offset != 0) {
             int cfunc = 0;
-            if (offset & ((uintptr_t)1 << (8 * sizeof(uintptr_t) - 1))) {
+            if (offset & ((uintptr_t)1 << (8 * sizeof(uint32_t) - 1))) {
                 // if high bit is set, this is cfunc, not func
                 cfunc = 1;
                 offset = ~offset;
@@ -981,7 +989,7 @@ static void jl_update_all_gvars(jl_serializer_state *s)
     uintptr_t gvars = (uintptr_t)&s->gvar_record->buf[0];
     uintptr_t end = gvars + s->gvar_record->size;
     while (gvars < end) {
-        size_t offset = (int32_t)load_uint32_be(&gvars); // sign-extended load
+        uint32_t offset = load_uint32_be(&gvars);
         if (offset) {
             uintptr_t v = get_item_for_reloc(s, base, size, offset);
             *sysimg_gvars[gvname_index] = v;
@@ -1227,7 +1235,7 @@ static void jl_save_system_image_to_stream(ios_t *f)
         uintptr_t i;
         for (i = 0; i < deser_tag.len; i++) {
             jl_value_t *v = (jl_value_t*)deser_tag.items[i];
-            record_gvar(&s, jl_get_llvm_gv(v), (TagRef << 28) + i);
+            record_gvar(&s, jl_get_llvm_gv(v), ((uintptr_t)TagRef << RELOC_TAG_OFFSET) + i);
         }
     }
 
@@ -1610,16 +1618,16 @@ static void jl_init_serializer2(int for_serialize)
         if (jl_is_symbol(v)) {
             arraylist_push(&deser_sym, v);
             if (for_serialize)
-                ptrhash_put(&symbol_table, v, (void*)((char*)HT_NOTFOUND + (SymbolRef << 28) + deser_sym.len));
+                ptrhash_put(&symbol_table, v, (void*)((char*)HT_NOTFOUND + ((uintptr_t)SymbolRef << RELOC_TAG_OFFSET) + deser_sym.len));
         }
         else {
             arraylist_push(&deser_tag, v);
             if (for_serialize)
-                ptrhash_put(&sertag_table, v, (void*)((char*)HT_NOTFOUND + (TagRef << 28) + deser_tag.len));
+                ptrhash_put(&sertag_table, v, (void*)((char*)HT_NOTFOUND + ((uintptr_t)TagRef << RELOC_TAG_OFFSET) + deser_tag.len));
         }
     }
     assert(i + 1 == sizeof(tags) / sizeof(tags[0]));
-    assert(!for_serialize || ptrhash_get(&sertag_table, ptls->root_task) == (char*)HT_NOTFOUND + (TagRef << 28) + 3);
+    assert(!for_serialize || ptrhash_get(&sertag_table, ptls->root_task) == (char*)HT_NOTFOUND + ((uintptr_t)TagRef << RELOC_TAG_OFFSET) + 3);
     nsym_tag = deser_sym.len;
 
     // this also ensures all objects referenced in the code have
@@ -1632,12 +1640,12 @@ static void jl_init_serializer2(int for_serialize)
         jl_value_t *v32 = jl_box_int32(i - NBOX_C / 2);
         arraylist_push(&deser_tag, v32);
         if (for_serialize)
-            ptrhash_put(&sertag_table, v32, (void*)((char*)HT_NOTFOUND + (TagRef << 28) + deser_tag.len));
+            ptrhash_put(&sertag_table, v32, (void*)((char*)HT_NOTFOUND + ((uintptr_t)TagRef << RELOC_TAG_OFFSET) + deser_tag.len));
 
         jl_value_t *v64 = jl_box_int64(i - NBOX_C / 2);
         arraylist_push(&deser_tag, v64);
         if (for_serialize)
-            ptrhash_put(&sertag_table, v64, (void*)((char*)HT_NOTFOUND + (TagRef << 28) + deser_tag.len));
+            ptrhash_put(&sertag_table, v64, (void*)((char*)HT_NOTFOUND + ((uintptr_t)TagRef << RELOC_TAG_OFFSET) + deser_tag.len));
     }
 
     if (for_serialize) {
