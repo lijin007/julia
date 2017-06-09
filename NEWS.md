@@ -62,7 +62,8 @@ Library improvements
     git repo. Additionally, the argument order was changed to be consistent with the git
     command line tool ([#22062]).
 
-  * `@test isequal(x, y)` now prints an evaluated expression when the test fails ([#22296]).
+  * `@test isequal(x, y)` and `@test isapprox(x, y)` now prints an evaluated expression when
+    the test fails ([#22296]).
 
 Compiler/Runtime improvements
 -----------------------------
