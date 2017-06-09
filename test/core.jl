@@ -2215,6 +2215,10 @@ mutable struct Obj; x; end
         push!(r, x)
         push!(wr, WeakRef(x))
     end
+    @noinline function wr_pop!(a)
+        pop!(a)
+        nothing
+    end
     test_wr(r,wr) = @test r[1] == wr[1].value
     function test_wr()
         ref = []
@@ -2223,7 +2227,7 @@ mutable struct Obj; x; end
         test_wr(ref, wref)
         gc()
         test_wr(ref, wref)
-        pop!(ref)
+        wr_pop!(ref)
         gc()
         @test wref[1].value === nothing
     end
