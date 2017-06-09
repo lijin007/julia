@@ -843,3 +843,10 @@ f21771(::Val{U}) where {U} = Tuple{g21771(U)}
 # ensure that we don't try to resolve cycles using uncached edges
 f21653() = f21653()
 @test code_typed(f21653, Tuple{}, optimize=false)[1] isa Pair{CodeInfo, typeof(Union{})}
+
+# issue #22290
+f22290() = return nothing
+for i in 1:3
+    ir = sprint(io->code_llvm(io, f22290, Tuple{}))
+    @test contains(ir, "julia_f22290")
+end
