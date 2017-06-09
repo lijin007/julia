@@ -753,27 +753,32 @@ function limit_type_depth(t::ANY, d::Int, cov::Bool, vars::Vector{TypeVar}=TypeV
     return R
 end
 
+# limit the complexity of type `t` to be simpler than the comparison type `compare`
+# no new values may be introduced, so the parameter `source` encodes the set of all values already present
 function limit_type_size(t::ANY, compare::ANY, source::ANY)
     source = svec(unwrap_unionall(compare), unwrap_unionall(source))
     source[1] === source[2] && (source = svec(source[1]))
     type_more_complex(t, compare, source, TUPLE_COMPLEXITY_LIMIT_DEPTH) || return t
     r = _limit_type_size(t, compare, source)
-    #@assert !isa(t, Type) || t <: r
+    @assert t <: r
+    #@assert r === _limit_type_size(r, t, source) # this monotonicity constraint is slightly stronger than actually required,
+      # since we only actually need to demonstrate that repeated application would reaches a fixed point,
+      #not that it is already at the fixed point
     return r
 end
 
 sym_isless(a::Symbol, b::Symbol) = ccall(:strcmp, Int32, (Ptr{UInt8}, Ptr{UInt8}), a, b) < 0
 
 function type_more_complex(t::ANY, c::ANY, sources::SimpleVector, tupledepth::Int)
-    # detect cases where the comparison is already trivially true
+    # detect cases where the comparison is trivial
     if t === c
         return false
     elseif t === Union{}
         return false # Bottom is as simple as they come
     elseif isa(t, DataType) && isempty(t.parameters)
         return false # fastpath: unparameterized types are always finite
-    elseif tupledepth > 0 && isa(t, Type) && isa(c, Type) && c !== Union{} && c <: t
-        return false # t is already wider than the comparison
+    elseif tupledepth > 0 && isa(unwrap_unionall(t), DataType) && isa(c, Type) && c !== Union{} && c <: t
+        return false # t is already wider than the comparison in the type lattice
     elseif tupledepth > 0 && is_derived_type_from_any(unwrap_unionall(t), sources)
         return false # t isn't something new
     end
@@ -828,7 +833,7 @@ function type_more_complex(t::ANY, c::ANY, sources::SimpleVector, tupledepth::In
                                 !tPi.abstract && !cPi.abstract &&
                                 sym_isless(cPi.name.name, tPi.name.name)
                             # allow collect on (anonymous) Generators to nest, provided that their functions are appropriately ordered
-                            # TODO: is there a better way
+                            # TODO: is there a better way?
                             continue
                         end
                     end
@@ -903,8 +908,8 @@ function _limit_type_size(t::ANY, c::ANY, sources::SimpleVector) # type vs. comp
         return t # easy case
     elseif isa(t, DataType) && isempty(t.parameters)
         return t # fast path: unparameterized are always simple
-    elseif isa(t, Type) && isa(c, Type) && c !== Union{} && c <: t
-        return t # t is already wider than the comparison
+    elseif isa(unwrap_unionall(t), DataType) && isa(c, Type) && c !== Union{} && c <: t
+        return t # t is already wider than the comparison in the type lattice
     elseif is_derived_type_from_any(unwrap_unionall(t), sources)
         return t # t isn't something new
     end
@@ -966,7 +971,7 @@ function _limit_type_size(t::ANY, c::ANY, sources::SimpleVector) # type vs. comp
                         Q[np] = tuple_tail_elem(Bottom, Any[ tP[i] for i in np:length(tP) ])
                     end
                     for i = 1:np
-                        Q[i] = _limit_type_size(Q[i], cP[i], sources) # TODO: apply type_more_complex here?
+                        Q[i] = _limit_type_size(Q[i], cP[i], sources)
                     end
                     return Tuple{Q...}
                 end
@@ -978,7 +983,18 @@ function _limit_type_size(t::ANY, c::ANY, sources::SimpleVector) # type vs. comp
                 is_derived_type_from_any(tt, sources) && return t
             end
         end
-        return t.name.wrapper
+        if isvarargtype(t)
+            # never replace Vararg with non-Vararg
+            return Vararg
+        end
+        widert = t.name.wrapper
+        if !(t <: widert)
+            # This can happen when a typevar has bounds too wide for its context, e.g.
+            # `Complex{T} where T` is not a subtype of `Complex`. In that case widen even
+            # faster to something safe to ensure the result is a supertype of the input.
+            return Any
+        end
+        return widert
     end
     return Any
 end
